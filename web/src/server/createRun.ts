@@ -187,31 +187,38 @@ export const createRun = withServerPromise(
           console.log(data, __result);
           break;
         case "classic":
-          const body = {
+        const body = {
             ...shareData,
             prompt_id: prompt_id,
-          };
-          // console.log(body);
-          const comfyui_endpoint = `${machine.endpoint}/comfyui-deploy/run`;
-          const _result = await fetch(comfyui_endpoint, {
+        };
+        const comfyui_endpoint = `${machine.endpoint}/comfyui-deploy/run`;
+        console.log(`Sending request to: ${comfyui_endpoint}`);
+        console.log(`Request body: ${JSON.stringify(body)}`);
+        try {
+            const _result = await fetch(comfyui_endpoint, {
             method: "POST",
             body: JSON.stringify(body),
             cache: "no-store",
-          });
-          // console.log(_result);
-
-          if (!_result.ok) {
+            });
+            console.log(`Response status: ${_result.status} ${_result.statusText}`);
+            const responseText = await _result.text();
+            console.log(`Response body: ${responseText}`);
+        
+            if (!_result.ok) {
             let message = `Error creating run, ${_result.statusText}`;
             try {
-              const result = await ComfyAPI_Run.parseAsync(
-                await _result.json(),
-              );
-              message += ` ${result.node_errors}`;
-            } catch (error) {}
+                const result = await ComfyAPI_Run.parseAsync(JSON.parse(responseText));
+                message += ` ${result.node_errors}`;
+            } catch (error) {
+                console.error("Error parsing response:", error);
+            }
             throw new Error(message);
-          }
-          // prompt_id = result.prompt_id;
-          break;
+            }
+        } catch (error) {
+            console.error("Fetch error:", error);
+            throw error;
+        }
+        break;
       }
     } catch (e) {
       console.error(e);
