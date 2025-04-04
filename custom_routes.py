@@ -1388,10 +1388,6 @@ async def send_json_override(self, event, data, sid=None):
             logger.info(format_table(headers, table_data))
             # print("========================\n")
 
-            timeline = format_execution_timeline(NODE_EXECUTION_TIMES)
-            logger.info(f"\nNode Execution Timeline:\n{timeline}")
-            # Clear the execution times for the next run
-
     # the last executing event is none, then the workflow is finished
     if event == "executing" and data.get("node") is None:
         mark_prompt_done(prompt_id=prompt_id)
@@ -2543,6 +2539,9 @@ class UploadQueue:
                         },
                     )
 
+                    # Mark this node as no longer uploading
+                    await update_file_status(prompt_id, data, False, node_id=node_id)
+
                     # If this was the last file for this prompt, show the stats summary
                     if (
                         prompt_id in self.pending_uploads
@@ -2693,6 +2692,9 @@ class UploadQueue:
                             and node_id in self.node_uploads[prompt_id]
                         ):
                             self.node_uploads[prompt_id][node_id].discard(upload_id)
+
+                            # Mark this node as no longer uploading after successful upload
+                            await update_file_status(prompt_id, None, False, node_id=node_id)
 
                             # If this was the last upload for this node, clean up node data
                             if not self.node_uploads[prompt_id][node_id]:
