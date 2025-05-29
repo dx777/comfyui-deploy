@@ -139,7 +139,9 @@ async def async_request_with_retry(
                 logger.error(f"Error response body: {error_body}")
 
             if attempt == max_retries - 1:
-                logger.error(f"Request {method} : {url} failed after {max_retries} attempts: {e}")
+                logger.error(
+                    f"Request {method} : {url} failed after {max_retries} attempts: {e}"
+                )
                 raise
 
         await asyncio.sleep(retry_delay)
@@ -155,6 +157,8 @@ from logging import basicConfig, getLogger
 
 # Check for an environment variable to enable/disable Logfire
 use_logfire = os.environ.get("USE_LOGFIRE", "false").lower() == "true"
+
+API_KEY_COMFY_ORG = os.environ.get("API_KEY_COMFY_ORG", None)
 
 if use_logfire:
     try:
@@ -281,6 +285,9 @@ def post_prompt(json_data):
         if "extra_data" in json_data:
             extra_data = json_data["extra_data"]
 
+        if API_KEY_COMFY_ORG is not None:
+            extra_data["api_key_comfy_org"] = API_KEY_COMFY_ORG
+
         if "client_id" in json_data:
             extra_data["client_id"] = json_data["client_id"]
         if valid[0]:
@@ -314,7 +321,7 @@ def randomSeed(num_digits=15):
     return random.randint(range_start, range_end)
 
 
-def apply_random_seed_to_workflow(workflow_api):
+def apply_random_seed_to_workflow(workflow_api, workflow):
     """
     Applies a random seed to each element in the workflow_api that has a 'seed' input.
 
@@ -327,6 +334,41 @@ def apply_random_seed_to_workflow(workflow_api):
                 # If seed is a list, it's an input from another node (generally `external number int`)
                 if isinstance(workflow_api[key]["inputs"]["seed"], list):
                     continue
+
+                # Check node type in workflow to determine if we should randomize
+                node_id = key
+                should_skip = (
+                    False  # Add a flag to track if we should skip randomization
+                )
+
+                for node in workflow["nodes"]:
+                    if str(node["id"]) == node_id and node["type"] == "KSampler":
+                        # Check if this node has widgets_values and if seed setting is not "fixed"
+                        if "widgets_values" in node and len(node["widgets_values"]) > 1:
+                            seed_mode = node["widgets_values"][1]
+                            if seed_mode == "fixed":
+                                # Skip randomization for fixed seeds
+                                logger.info(
+                                    f"Skipping random seed for KSampler (node {node_id}) as it's set to fixed"
+                                )
+                                should_skip = True  # Set the flag to skip randomization
+                                break  # Exit the inner loop
+
+                            # Apply random seed for non-fixed seeds (randomize, iter, etc.)
+                            workflow_api[key]["inputs"]["seed"] = randomSeed()
+                            logger.info(
+                                f"Applied random seed {workflow_api[key]['inputs']['seed']} to KSampler (node {node_id})"
+                            )
+                            should_skip = (
+                                True  # Set the flag to skip default randomization
+                            )
+                            break  # Exit the inner loop
+                        break  # This break will skip checking other nodes if widgets_values doesn't exist
+
+                # Skip the rest of the code for this key if we already handled it
+                if should_skip:
+                    continue
+
                 # Special case for SONICSampler
                 if workflow_api[key]["class_type"] == "SONICSampler":
                     workflow_api[key]["inputs"]["seed"] = randomSeed("sonic")
@@ -413,6 +455,9 @@ def apply_inputs_to_workflow(workflow_api: Any, inputs: Any, sid: str = None):
                 if value["class_type"] == "ComfyUIDeployExternalImageBatch":
                     value["inputs"]["images"] = new_value
 
+                if value["class_type"] == "ComfyUIDeployExternalEnum":
+                    value["inputs"]["default_value"] = new_value
+
                 if value["class_type"] == "ComfyUIDeployExternalLora":
                     value["inputs"]["lora_url"] = new_value
 
@@ -431,6 +476,12 @@ def apply_inputs_to_workflow(workflow_api: Any, inputs: Any, sid: str = None):
                 if value["class_type"] == "ComfyUIDeployExternalEXR":
                     value["inputs"]["exr_file"] = new_value
 
+                if value["class_type"] == "ComfyUIDeployExternalSeed":
+                    logger.info(
+                        f"Applied random seed {new_value} to {value['class_type']}"
+                    )
+                    value["inputs"]["default_value"] = new_value
+
 
 def send_prompt(sid: str, inputs: StreamingPrompt):
     # workflow_api = inputs.workflow_api
@@ -438,7 +489,7 @@ def send_prompt(sid: str, inputs: StreamingPrompt):
     workflow = copy.deepcopy(inputs.workflow)
 
     # Random seed
-    apply_random_seed_to_workflow(workflow_api)
+    apply_random_seed_to_workflow(workflow_api, workflow)
 
     logger.info("getting inputs", inputs.inputs)
 
@@ -524,7 +575,7 @@ async def comfy_deploy_run(request):
     workflow = data.get("workflow")
 
     # Now it handles directly in here
-    apply_random_seed_to_workflow(workflow_api)
+    apply_random_seed_to_workflow(workflow_api, workflow)
     apply_inputs_to_workflow(workflow_api, inputs)
 
     prompt = {
@@ -591,7 +642,7 @@ async def stream_prompt(data, token):
     gpu_event_id = data.get("gpu_event_id", None)
 
     # Now it handles directly in here
-    apply_random_seed_to_workflow(workflow_api)
+    apply_random_seed_to_workflow(workflow_api, workflow)
     apply_inputs_to_workflow(workflow_api, inputs)
 
     prompt = {
@@ -1310,7 +1361,7 @@ send_json = prompt_server.send_json
 
 
 async def send_json_override(self, event, data, sid=None):
-    # logger.info("INTERNAL:", event, data, sid)
+    # logger.info(f"INTERNAL: event={event}, data={data}, sid={sid}")
     prompt_id = data.get("prompt_id")
 
     target_sid = sid
@@ -1391,9 +1442,12 @@ async def send_json_override(self, event, data, sid=None):
     # the last executing event is none, then the workflow is finished
     if event == "executing" and data.get("node") is None:
         mark_prompt_done(prompt_id=prompt_id)
+        # We will now rely on the UploadQueue worker to set the final SUCCESS status
+        # after all uploads are confirmed complete.
+
         if not have_pending_upload(prompt_id):
-            await update_run(prompt_id, Status.SUCCESS)
-            if prompt_id in prompt_metadata:
+            # await update_run(prompt_id, Status.SUCCESS) # <-- REMOVE/COMMENT OUT
+            if prompt_id in prompt_metadata:  # <-- REMOVE/COMMENT OUT THIS BLOCK
                 current_time = time.perf_counter()
                 if prompt_metadata[prompt_id].start_time is not None:
                     elapsed_time = current_time - prompt_metadata[prompt_id].start_time
@@ -1834,12 +1888,13 @@ async def upload_file(
 
 
 def have_pending_upload(prompt_id):
+    # Check if there are pending uploads in the queue
     if (
-        prompt_id in prompt_metadata
-        and len(prompt_metadata[prompt_id].uploading_nodes) > 0
+        prompt_id in upload_queue.pending_uploads
+        and upload_queue.pending_uploads[prompt_id]
     ):
         logger.info(
-            f"Have pending upload {len(prompt_metadata[prompt_id].uploading_nodes)}"
+            f"Have pending upload {len(upload_queue.pending_uploads[prompt_id])}"
         )
         return True
 
@@ -1894,16 +1949,11 @@ async def handle_error(prompt_id, data, e: Exception):
 async def update_file_status(
     prompt_id: str, data, uploading, have_error=False, node_id=None
 ):
-    # if 'uploading_nodes' not in prompt_metadata[prompt_id]:
-    #     prompt_metadata[prompt_id]['uploading_nodes'] = set()
+    # We're using upload_queue as the single source of truth for tracking uploads
+    # The upload_queue.pending_uploads is managed by the UploadQueue class itself
+    # We no longer need to track uploading_nodes in prompt_metadata
 
-    if node_id is not None:
-        if uploading:
-            prompt_metadata[prompt_id].uploading_nodes.add(node_id)
-        else:
-            prompt_metadata[prompt_id].uploading_nodes.discard(node_id)
-
-    # logger.info(f"Remaining uploads: {prompt_metadata[prompt_id].uploading_nodes}")
+    # logger.info(f"Pending uploads in queue: {upload_queue.pending_uploads.get(prompt_id, set())}")
     # Update the remote status
 
     if have_error:
@@ -1917,15 +1967,15 @@ async def update_file_status(
         return
 
     # if there are still nodes that are uploading, then we set the status to uploading
-    if uploading:
-        if prompt_metadata[prompt_id].status != Status.UPLOADING:
-            await update_run(prompt_id, Status.UPLOADING)
-            await send(
-                "uploading",
-                {
-                    "prompt_id": prompt_id,
-                },
-            )
+    # if uploading:
+    #     if prompt_metadata[prompt_id].status != Status.UPLOADING:
+    #         await update_run(prompt_id, Status.UPLOADING)
+    #         await send(
+    #             "uploading",
+    #             {
+    #                 "prompt_id": prompt_id,
+    #             },
+    #         )
 
     # if there are no nodes that are uploading, then we set the status to success
     elif (
@@ -1951,7 +2001,7 @@ async def handle_upload(
 
     for item in items:
         # Skipping temp files
-        if item.get("type") == "temp":
+        if isinstance(item, dict) and item.get("type") == "temp":
             continue
 
         file_type = item.get(content_type_key, default_content_type)
@@ -2002,22 +2052,29 @@ async def upload_in_background(
                 ("files", "content_type", "image/png"),
                 ("gifs", "format", "image/gif"),
                 ("model_file", "format", "application/octet-stream"),
+                ("result", "format", "application/octet-stream"),
+                ("text_file", "format", "text/plain"),
             ]:
                 items = data.get(file_type, [])
 
                 for item in items:
                     # if is model_file, just add it to the data
-                    if file_type == "model_file":
+                    if file_type == "model_file" or file_type == "result":
                         if isinstance(item, str):
                             filename = os.path.basename(item)
+                            # Extract folder name from the path
+                            folder_path = os.path.dirname(item)
+                            subfolder = (
+                                os.path.basename(folder_path) if folder_path else ""
+                            )
                             item = {
                                 "filename": filename,
-                                "subfolder": "",
+                                "subfolder": subfolder,
                                 "type": "output",
                             }
 
                     # Skip temp files
-                    if item.get("type") == "temp":
+                    if isinstance(item, dict) and item.get("type") == "temp":
                         continue
 
                     # Add to the upload queue instead of uploading immediately
@@ -2082,6 +2139,8 @@ async def update_run_with_output(
             or "files" in data
             or "gifs" in data
             or "model_file" in data
+            or "result" in data
+            or "text_file" in data
         )
     if bypass_upload and have_upload_media:
         print(
@@ -2392,6 +2451,11 @@ class UploadQueue:
             logger.warning(f"No upload endpoint for prompt ID: {prompt_id}")
             return
 
+        # Check if file_info is a valid dictionary with a filename
+        if not isinstance(file_info, dict) or "filename" not in file_info:
+            logger.warning(f"Invalid file_info for prompt ID {prompt_id}: {file_info}")
+            return
+
         filename = file_info.get("filename")
         subfolder = file_info.get("subfolder")
         file_type = file_info.get("type", "output")
@@ -2545,8 +2609,12 @@ class UploadQueue:
                     # If this was the last file for this prompt, show the stats summary
                     if (
                         prompt_id in self.pending_uploads
+                        # We now rely on the worker's finally block for the final SUCCESS update.
+                        # Check if the set becomes empty *after* removal in the worker.
                         and len(self.pending_uploads[prompt_id]) == 1
                     ):
+                        # await update_run(prompt_id, Status.SUCCESS) # <-- REMOVE/COMMENT OUT
+
                         self._log_upload_stats(prompt_id)
                         # Clean up stats
                         del self.upload_stats[prompt_id]
@@ -2666,6 +2734,8 @@ class UploadQueue:
                 file_info = upload_task["file_info"]
                 node_id = upload_task["node_id"]
                 upload_id = upload_task["upload_id"]
+
+                print(file_info)
 
                 try:
                     # Coordinate the actual start of the upload
